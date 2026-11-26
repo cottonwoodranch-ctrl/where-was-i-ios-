@@ -1,0 +1,99 @@
+name: WhereWasI
+options:
+  bundleIdPrefix: com.iqbal
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1" # iPhone only
+    MARKETING_VERSION: "0.3"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: "" # set in Xcode or CI (APPLE_TEAM_ID)
+targets:
+  WhereWasICore:
+    type: framework
+    platform: iOS
+    sources:
+      - path: Sources/WhereWasICore
+      - path: Resources/Core/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.iqbal.wherewasi.core
+        TARGETED_DEVICE_FAMILY: "1"
+        PRODUCT_NAME: WhereWasICore
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Automatic
+        DEFINES_MODULE: YES
+        ENABLE_TESTABILITY: YES
+  WhereWasI:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - PrivacyInfo.xcprivacy
+      - path: App/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - target: WhereWasICore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.iqbal.wherewasi # replace if this id is taken
+        PRODUCT_NAME: WhereWasI
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1" # iPhone only
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+  WhereWasITests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/WhereWasICoreTests
+    dependencies:
+      - target: WhereWasICore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.iqbal.wherewasi.tests
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@loader_path/Frameworks"
+schemes:
+  WhereWasI:
+    build:
+      targets:
+        WhereWasICore: all
+        WhereWasI: all
+        WhereWasITests:
+          - testing
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - WhereWasITests
+    archive:
+      config: Release
+  WhereWasICore:
+    build:
+      targets:
+        WhereWasICore: all
+        WhereWasITests:
+          - testing
+    test:
+      config: Debug
+      targets:
+        - WhereWasITests

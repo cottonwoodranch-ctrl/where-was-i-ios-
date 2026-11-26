@@ -1,0 +1,71 @@
+# Codemagic CI for "Where Was I?" iOS.
+# Placeholders are marked YOUR_* or $APP_STORE_CONNECT_*.
+# Do not commit real API keys. Set them in the Codemagic UI (or a
+# secure environment group) after you have an Apple Developer account.
+#
+# This file does not sign you up for Codemagic or Apple. You do that
+# yourself, then paste the values below / in the UI.
+
+workflows:
+  ios-workflow:
+    name: iOS TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    # Optional: link an App Store Connect integration created in the
+    # Codemagic UI, instead of (or as well as) the API-key vars below.
+    # integrations:
+    #   app_store_connect: YOUR_CODEMAGIC_ASC_INTEGRATION_NAME
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        # PLACEHOLDER — must match the App ID you register on developer.apple.com
+        bundle_identifier: com.iqbal.wherewasi
+      vars:
+        # PLACEHOLDER — change if you register a different App ID
+        BUNDLE_ID: "com.iqbal.wherewasi"
+        XCODE_PROJECT: "WhereWasI.xcodeproj"
+        XCODE_SCHEME: "WhereWasI"
+        # PLACEHOLDER — numeric Apple ID of the app in App Store Connect,
+        # created after you enroll in the Apple Developer Program.
+        APP_STORE_APP_ID: "YOUR_APP_STORE_CONNECT_APP_ID"
+      xcode: latest
+    scripts:
+      - name: Install XcodeGen
+        script: |
+          brew install xcodegen
+      - name: Set a unique build number
+        script: |
+          # App Store Connect rejects a second upload with the same build number.
+          sed -i "" "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"$BUILD_NUMBER\"/" project.yml
+          grep CURRENT_PROJECT_VERSION project.yml
+      - name: Generate Xcode project
+        script: |
+          xcodegen generate
+      - name: Set bundle identifier (if overridden in the UI)
+        script: |
+          /usr/libexec/PlistBuddy -c "Set :objects:PRODUCT_BUNDLE_IDENTIFIER $BUNDLE_ID" \
+            WhereWasI.xcodeproj/project.pbxproj 2>/dev/null || true
+          sed -i "" "s/com.iqbal.wherewasi/$BUNDLE_ID/g" project.yml
+          xcodegen generate
+      - name: Use code signing profiles from Codemagic
+        script: |
+          xcode-project use-profiles
+      - name: Build IPA
+        script: |
+          xcode-project build-ipa \
+            --project "$XCODE_PROJECT" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        # PLACEHOLDERS — App Store Connect API key (Issuer ID, Key ID, .p8).
+        # In the Codemagic UI, add these as encrypted environment variables
+        # or upload the .p8 and map the names. Do not paste the private key
+        # into this file.
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        submit_to_testflight: true
+        # expire_build_submitted_for_review: false

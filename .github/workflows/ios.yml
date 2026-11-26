@@ -1,0 +1,221 @@
+# GitHub Actions for "Where Was I?" iOS.
+# The default job needs no secrets: it builds an unsigned simulator
+# binary and runs the VAD / stall unit tests on macos-latest.
+#
+# A second job archives and uploads to TestFlight only when the
+# required secrets are present. Leave them unset and that job is skipped.
+#
+# Secrets (all optional until you want a signed TestFlight build):
+#   APP_STORE_CONNECT_API_KEY        contents of the AuthKey_XXXXXXXXXX.p8 file
+#   APP_STORE_CONNECT_API_KEY_ID     the Key ID
+#   APP_STORE_CONNECT_ISSUER_ID      the Issuer ID
+#   BUILD_CERTIFICATE_BASE64         base64-encoded .p12 distribution cert
+#   P12_PASSWORD                     password for that .p12
+#   BUILD_PROVISION_PROFILE_BASE64   base64-encoded App Store .mobileprovision
+#   APPLE_TEAM_ID                    10-character Team ID
+#   BUNDLE_ID                        optional override, default com.iqbal.wherewasi
+#
+# This file does not create a GitHub or Apple account for you.
+
+name: iOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-simulator:
+    name: Unsigned simulator build + unit tests
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned simulator app
+        run: |
+          xcodebuild \
+            -project WhereWasI.xcodeproj \
+            -scheme WhereWasI \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Run VAD and stall unit tests
+        run: |
+          set -euo pipefail
+          DEST=$(python3 - <<'PY'
+          import json, subprocess, sys
+          data = json.loads(subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"]
+          ))
+          # Prefer a recent iPhone on the newest iOS runtime.
+          runtimes = [r for r in data.get("devices", {}) if "iOS" in r]
+          runtimes.sort(reverse=True)
+          for runtime in runtimes:
+              phones = [d for d in data["devices"][runtime]
+                        if d.get("isAvailable") and "iPhone" in d.get("name", "")]
+              if phones:
+                  print(f"platform=iOS Simulator,id={phones[0]['udid']}")
+                  sys.exit(0)
+          sys.exit("No available iPhone simulator found")
+          PY
+          )
+          echo "Using destination: $DEST"
+          xcodebuild test \
+            -project WhereWasI.xcodeproj \
+            -scheme WhereWasI \
+            -configuration Debug \
+            -destination "$DEST" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+  signed-testflight:
+    name: Signed archive and TestFlight (optional)
+    runs-on: macos-latest
+    needs: test-simulator
+    steps:
+      - name: Check whether signing secrets are present
+        id: secrets
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          ISSUER: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          CERT: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROFILE: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$KEY_ID" ] && [ -n "$ISSUER" ] && [ -n "$KEY" ] && \
+             [ -n "$CERT" ] && [ -n "$CERT_PASSWORD" ] && \
+             [ -n "$PROFILE" ] && [ -n "$TEAM" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping signed archive: one or more of APP_STORE_CONNECT_* / BUILD_CERTIFICATE_BASE64 / P12_PASSWORD / BUILD_PROVISION_PROFILE_BASE64 / APPLE_TEAM_ID are unset."
+          fi
+
+      - name: Checkout
+        if: steps.secrets.outputs.present == 'true'
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        if: steps.secrets.outputs.present == 'true'
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        if: steps.secrets.outputs.present == 'true'
+        run: xcodegen generate
+
+      - name: Import signing certificate and profile
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          CERT: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROFILE: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          echo "$CERT" | base64 --decode > "$CERTIFICATE_PATH"
+          echo "$PROFILE" | base64 --decode > "$PP_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERT_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PP_UUID=$(security cms -D -i "$PP_PATH" | plutil -extract UUID raw -)
+          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PP_UUID.mobileprovision"
+          echo "Installed profile $PP_UUID"
+
+          # Unique build number per run (App Store Connect rejects duplicates)
+          sed -i "" "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"${{ github.run_number }}\"/" project.yml
+          xcodegen generate
+
+          # Optional bundle id override
+          if [ -n "${BUNDLE_ID:-}" ]; then
+            sed -i "" "s/com.iqbal.wherewasi/$BUNDLE_ID/g" project.yml
+            xcodegen generate
+          fi
+
+      - name: Archive
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project WhereWasI.xcodeproj \
+            -scheme WhereWasI \
+            -configuration Release \
+            -archivePath build/WhereWasI.xcarchive \
+            -destination 'generic/platform=iOS' \
+            DEVELOPMENT_TEAM="$TEAM" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution"
+
+      - name: Export IPA
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          cat > build/ExportOptions.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>teamID</key>
+            <string>TEAM_PLACEHOLDER</string>
+          </dict>
+          </plist>
+          PLIST
+          /usr/libexec/PlistBuddy -c "Set :teamID ${{ secrets.APPLE_TEAM_ID }}" build/ExportOptions.plist
+          xcodebuild -exportArchive \
+            -archivePath build/WhereWasI.xcarchive \
+            -exportPath build/ipa \
+            -exportOptionsPlist build/ExportOptions.plist
+
+      - name: Upload to TestFlight
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s\n' "$APP_STORE_CONNECT_API_KEY" > "$KEY_PATH"
+          IPA=$(ls build/ipa/*.ipa | head -n 1)
+          echo "Uploading $IPA"
+          xcrun altool --upload-app --type ios --file "$IPA" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"

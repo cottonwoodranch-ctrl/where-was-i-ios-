@@ -1,0 +1,15 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.ipa
+*.dSYM/
+*.p8
+*.p12
+*.mobileprovision
+AuthKey_*.p8
+ExportOptions.plist
