@@ -13,7 +13,7 @@ import WhereWasICore
 /// All audio stays in memory. Capture is off while a replay plays, so the app never hears itself.
 @MainActor
 final class CaptureController: ObservableObject {
-    static let sampleRate = 16_000
+    nonisolated static let sampleRate = 16_000
     /// Ignore the microphone this long after a replay ends (replay tail / room echo).
     static let postPlaybackHoldoff: TimeInterval = 0.35
     /// With VoiceOver on, announce first and wait this long so speech and replay don't overlap.
@@ -37,8 +37,10 @@ final class CaptureController: ObservableObject {
     var permissionDenied: Bool { phase == .needsPermission }
 
     nonisolated let pipeline = ListeningPipeline(sampleRate: CaptureController.sampleRate)
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    /// `var` so the whole graph can be rebuilt after a media-services reset (Apple requires
+    /// re-creating every AVAudio object then; the old ones are invalid).
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private let replayHaptic = UIImpactFeedbackGenerator(style: .soft)
     private let toggleHaptic = UIImpactFeedbackGenerator(style: .light)
     private let selectionHaptic = UISelectionFeedbackGenerator()
@@ -66,18 +68,22 @@ final class CaptureController: ObservableObject {
                 self?.apply(snap)
             }
         }
-        engine.attach(player)
-        let format = AVAudioFormat(
+        playerFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(Self.sampleRate),
             channels: 1,
             interleaved: false
         )
-        playerFormat = format
-        if let format {
-            engine.connect(player, to: engine.mainMixerNode, format: format)
-        }
+        configureGraph()
         installObservers()
+    }
+
+    /// Attach the replay player to the (current) engine.
+    private func configureGraph() {
+        engine.attach(player)
+        if let playerFormat {
+            engine.connect(player, to: engine.mainMixerNode, format: playerFormat)
+        }
     }
 
     deinit {
@@ -90,6 +96,12 @@ final class CaptureController: ObservableObject {
 
     /// Start listening if allowed (the scene became active, or onboarding finished).
     func start() {
+        // iOS does not always post "interruption ended" (e.g. after a call the user
+        // answered). Coming back to the foreground is our cue to try again.
+        if running && interrupted {
+            resumeAfterInterruption()
+            return
+        }
         guard !running, !starting else { return }
         if userPaused {
             setPhase(.stoppedByUser)
@@ -201,12 +213,10 @@ final class CaptureController: ObservableObject {
     private func beginSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            let bluetooth: AVAudioSession.CategoryOptions
-            if #available(iOS 18.0, *) {
-                bluetooth = .allowBluetoothHFP
-            } else {
-                bluetooth = .allowBluetooth
-            }
+            // Bluetooth HFP input (raw value 0x4). Xcode 26 renamed `.allowBluetooth` to
+            // `.allowBluetoothHFP` (same value, any iOS version) and Xcode 16 lacks the new
+            // name, so the raw value builds warning-free on both SDKs.
+            let bluetooth = AVAudioSession.CategoryOptions(rawValue: 0x4)
             // .defaultToSpeaker uses the loudspeaker instead of the earpiece when nothing else
             // is connected, but still honours AirPods / wired / car audio routes.
             try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, bluetooth])
@@ -240,23 +250,28 @@ final class CaptureController: ObservableObject {
         observers.append(center.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.restartAfterAudioChange() }
+            // Only restarts a stopped engine. A format change on a running engine arrives
+            // as AVAudioEngineConfigurationChange below; reinstalling the tap here, while the
+            // engine still runs with the old format, can raise a format-mismatch exception.
+            Task { @MainActor [weak self] in self?.restartAfterAudioChange(configurationChanged: false) }
         })
         // Posted when the hardware format changes (e.g. a Bluetooth headset connects).
         // The engine stops itself; it has to be restarted and the tap reinstalled.
+        // Observed for any engine and filtered, because the engine is rebuilt after a reset.
         observers.append(center.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.restartAfterAudioChange() }
+            forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let sender = note.object as? AVAudioEngine else { return }
+            let senderID = ObjectIdentifier(sender)
+            Task { @MainActor [weak self] in
+                guard let self, senderID == ObjectIdentifier(self.engine) else { return }
+                self.restartAfterAudioChange(configurationChanged: true)
+            }
         })
         observers.append(center.addObserver(
             forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.running else { return }
-                self.endCapture()
-                self.start()
-            }
+            Task { @MainActor [weak self] in self?.handleMediaServicesReset() }
         })
     }
 
@@ -274,30 +289,56 @@ final class CaptureController: ObservableObject {
             setPhase(.interrupted)
         case .ended:
             guard running, interrupted else { return }
-            interrupted = false
-            do {
-                try AVAudioSession.sharedInstance().setActive(true, options: [])
-                try startEngineWithTap()
-                pipeline.setAccepting(true)
-                setPhase(.listening)
-            } catch {
-                setPhase(.unavailable)
-            }
+            resumeAfterInterruption()
         @unknown default:
             break
         }
     }
 
-    private func restartAfterAudioChange() {
+    private func resumeAfterInterruption() {
+        guard running, interrupted else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true, options: [])
+            if engine.isRunning { engine.stop() } // the tap is reinstalled for the current format
+            try startEngineWithTap()
+            interrupted = false
+            pipeline.cancelPendingStall()
+            pipeline.setAccepting(true)
+            setPhase(.listening)
+        } catch {
+            // Still held by the other app (call in progress): stay "interrupted"; the next
+            // "ended" notification or return to the foreground tries again.
+            setPhase(.interrupted)
+        }
+    }
+
+    private func restartAfterAudioChange(configurationChanged: Bool) {
         guard running, !interrupted else { return }
-        // A configuration change stops the engine and its player node; a replay in
-        // progress will not report completion, so end it here.
-        if isPlaying && !player.isPlaying { finishPlayback() }
+        if engine.isRunning {
+            // Plain route change on a healthy engine (e.g. headphones unplugged, same format):
+            // the existing tap keeps working.
+            guard configurationChanged else { return }
+            engine.stop()
+        }
+        // The engine stopped, which also stopped the player node; a replay in progress
+        // will not report completion, so end it here (otherwise the app stays "replaying").
+        if isPlaying { finishPlayback() }
         do {
             try startEngineWithTap()
         } catch {
             setPhase(.unavailable)
         }
+    }
+
+    /// The media server restarted: every AVAudio object is now invalid. Rebuild the engine
+    /// graph and, if we were listening, start a fresh session.
+    private func handleMediaServicesReset() {
+        let wasRunning = running
+        if wasRunning { endCapture() }
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        configureGraph()
+        if wasRunning { start() }
     }
 
     private func tearDownAudio() {
@@ -310,18 +351,22 @@ final class CaptureController: ObservableObject {
     /// (Re)install the input tap for the current hardware format and make sure the
     /// engine is running. Safe to call repeatedly.
     private func startEngineWithTap() throws {
-        installTap()
+        try installTap()
         if !engine.isRunning {
             engine.prepare()
             try engine.start()
         }
     }
 
-    private func installTap() {
+    private struct NoMicrophoneInput: Error {}
+
+    /// Throws when there is no usable input (no input route, or no converter for it), so the
+    /// caller shows "Could not start the microphone" instead of a silent, deaf "Listening…".
+    private func installTap() throws {
         let input = engine.inputNode
         input.removeTap(onBus: 0)
         let hw = input.outputFormat(forBus: 0)
-        guard hw.sampleRate > 0, hw.channelCount > 0 else { return }
+        guard hw.sampleRate > 0, hw.channelCount > 0 else { throw NoMicrophoneInput() }
         let target = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(Self.sampleRate),
@@ -329,8 +374,7 @@ final class CaptureController: ObservableObject {
             interleaved: false
         )
         guard let target, let conv = AVAudioConverter(from: hw, to: target) else {
-            setPhase(.unavailable)
-            return
+            throw NoMicrophoneInput()
         }
         input.installTap(onBus: 0, bufferSize: 1024, format: hw,
                          block: Self.makeTapBlock(converter: conv, pipeline: pipeline))
