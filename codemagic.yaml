@@ -1,33 +1,24 @@
 # Codemagic CI for "Where Was I?" iOS.
-# Placeholders are marked YOUR_* or $APP_STORE_CONNECT_*.
-# Do not commit real API keys. Set them in the Codemagic UI (or a
-# secure environment group) after you have an Apple Developer account.
-#
-# This file does not sign you up for Codemagic or Apple. You do that
-# yourself, then paste the values below / in the UI.
+# Authenticates to App Store Connect via the account-level
+# Developer Portal integration named "codemagic_api_key"
+# (configured in the Codemagic UI). Do not commit real API keys or .p8 files.
 
 workflows:
   ios-workflow:
     name: iOS TestFlight
     instance_type: mac_mini_m2
     max_build_duration: 60
-    # Optional: link an App Store Connect integration created in the
-    # Codemagic UI, instead of (or as well as) the API-key vars below.
-    # integrations:
-    #   app_store_connect: YOUR_CODEMAGIC_ASC_INTEGRATION_NAME
+    integrations:
+      app_store_connect: codemagic_api_key
     environment:
       ios_signing:
         distribution_type: app_store
-        # PLACEHOLDER — must match the App ID you register on developer.apple.com
         bundle_identifier: com.iqbal.wherewasi
       vars:
-        # PLACEHOLDER — change if you register a different App ID
         BUNDLE_ID: "com.iqbal.wherewasi"
         XCODE_PROJECT: "WhereWasI.xcodeproj"
         XCODE_SCHEME: "WhereWasI"
-        # PLACEHOLDER — numeric Apple ID of the app in App Store Connect,
-        # created after you enroll in the Apple Developer Program.
-        APP_STORE_APP_ID: "YOUR_APP_STORE_CONNECT_APP_ID"
+        APP_STORE_APP_ID: "6839857964"
       xcode: latest
     scripts:
       - name: Install XcodeGen
@@ -60,12 +51,8 @@ workflows:
       - /tmp/xcodebuild_logs/*.log
     publishing:
       app_store_connect:
-        # PLACEHOLDERS — App Store Connect API key (Issuer ID, Key ID, .p8).
-        # In the Codemagic UI, add these as encrypted environment variables
-        # or upload the .p8 and map the names. Do not paste the private key
-        # into this file.
-        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
-        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
-        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        # Use the App Store Connect API key referenced in integrations
+        # (codemagic_api_key) to authenticate the TestFlight upload.
+        auth: integration
         submit_to_testflight: true
         # expire_build_submitted_for_review: false
